@@ -1,16 +1,31 @@
-import type {
-  Content,
-  GenerativeModel,
-  GoogleGenerativeAI,
-  Part,
-} from "@google/generative-ai"
-import { HarmBlockThreshold, HarmCategory } from "@google/generative-ai"
+import type { Content, GenerateContentRequest, Part } from "./gemini-api-client/types.ts"
+import { HarmBlockThreshold, HarmCategory } from "./gemini-api-client/types.ts"
 import type { OpenAI } from "./types.ts"
 
-export function getToken(headers: Record<string, string>): string | null {
+export interface ApiParam {
+  apikey: string
+  useBeta: boolean
+}
+
+export function getToken(headers: Record<string, string>): ApiParam | null {
   for (const [k, v] of Object.entries(headers)) {
     if (k.toLowerCase() === "authorization") {
-      return v.substring(v.indexOf(" ") + 1)
+      const rawApikey = v.substring(v.indexOf(" ") + 1)
+
+      if (!rawApikey.includes("#")) {
+        return {
+          apikey: rawApikey,
+          useBeta: false,
+        }
+      }
+
+      // todo read config from apikey
+      const apikey = rawApikey.substring(0, rawApikey.indexOf("#"))
+      const params = new URLSearchParams(rawApikey.substring(rawApikey.indexOf("#") + 1))
+      return {
+        apikey,
+        useBeta: params.has("useBeta"),
+      }
     }
   }
   return null
@@ -30,9 +45,7 @@ function parseBase64(base64: string): Part {
   }
 }
 
-export function openAiMessageToGeminiMessage(
-  messages: OpenAI.Chat.ChatCompletionMessageParam[],
-): Content[] {
+export function openAiMessageToGeminiMessage(messages: OpenAI.Chat.ChatCompletionMessageParam[]): Content[] {
   const result: Content[] = messages
     .flatMap(({ role, content }) => {
       if (role === "system") {
@@ -45,11 +58,7 @@ export function openAiMessageToGeminiMessage(
       const parts: Part[] =
         content == null || typeof content === "string"
           ? [{ text: content?.toString() ?? "" }]
-          : content.map((item) =>
-              item.type === "text"
-                ? { text: item.text }
-                : parseBase64(item.image_url.url),
-            )
+          : content.map((item) => (item.type === "text" ? { text: item.text } : parseBase64(item.image_url.url)))
 
       return [{ role: "user" === role ? "user" : "model", parts: parts }]
     })
@@ -63,9 +72,7 @@ export function openAiMessageToGeminiMessage(
   return result
 }
 
-function hasImageMessage(
-  messages: OpenAI.Chat.ChatCompletionMessageParam[],
-): boolean {
+function hasImageMessage(messages: OpenAI.Chat.ChatCompletionMessageParam[]): boolean {
   return messages.some((msg) => {
     const content = msg.content
     if (content == null) {
@@ -78,14 +85,11 @@ function hasImageMessage(
   })
 }
 
-export function genModel(
-  genAi: GoogleGenerativeAI,
-  req: OpenAI.Chat.ChatCompletionCreateParams,
-): GenerativeModel {
-  const model = genAi.getGenerativeModel({
-    model: hasImageMessage(req.messages)
-      ? GeminiModel.GEMINI_PRO_VISION
-      : GeminiModel.GEMINI_PRO,
+export function genModel(req: OpenAI.Chat.ChatCompletionCreateParams): [GeminiModel, GenerateContentRequest] {
+  const model = hasImageMessage(req.messages) ? GeminiModel.GEMINI_PRO_VISION : GeminiModel.GEMINI_PRO
+
+  const generateContentRequest: GenerateContentRequest = {
+    contents: openAiMessageToGeminiMessage(req.messages),
     generationConfig: {
       maxOutputTokens: req.max_tokens ?? undefined,
       temperature: req.temperature ?? undefined,
@@ -100,8 +104,8 @@ export function genModel(
       category,
       threshold: HarmBlockThreshold.BLOCK_NONE,
     })),
-  })
-  return model
+  }
+  return [model, generateContentRequest]
 }
 export enum GeminiModel {
   GEMINI_PRO = "gemini-pro",
