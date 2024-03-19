@@ -1,39 +1,47 @@
-enum LogLevel {
-  error = 3,
-  warn = 4,
-  info = 5,
-  debug = 7,
+export type Any = Parameters<typeof console.log>[0]
+
+export interface ILogger {
+  error: (...data: Any[]) => void
+  warn: (...data: Any[]) => void
+  info: (...data: Any[]) => void
+  debug: (...data: Any[]) => void
 }
-type Any = Parameters<typeof console.log>[0]
 
-// 设置日志级别为 error
-const currentlevel = LogLevel.error
+const LEVEL = ["debug", "info", "warn", "error"] as const
 
-export function gen_logger(id: string) {
-  return mapValues(LogLevel, (value, name) => {
-    return (msg: Any) => {
-      outFunc(name, value, `${id} ${JSON.stringify(msg)}`)
+interface Config {
+  level: (typeof LEVEL)[number]
+  prefix: string
+}
+
+export class Logger implements ILogger {
+  private config: Config
+
+  debug!: Log
+  info!: Log
+  warn!: Log
+  error!: Log
+
+  constructor(config?: Omit<Partial<Config>, "level"> & { level?: string }) {
+    const level = LEVEL.find((it) => it === config?.level) ?? "warn"
+    this.config = {
+      prefix: config?.prefix ?? "",
+      level,
     }
-  })
-}
 
-export type Logger = ReturnType<typeof gen_logger>
-
-function outFunc(levelName: string, levelValue: number, msg: string) {
-  if (levelValue > currentlevel) {
-    // 仅打印大于等于当前日志级别的日志
-    return
+    for (const m of LEVEL) {
+      this[m] = (...data: Any[]) => this.#write(m, ...data)
+    }
   }
-  console.log(`${Date.now().toLocaleString()} ${levelName} ${msg}`)
+
+  #write(level: Config["level"], ...data: Any[]) {
+    const { level: configLevel, prefix } = this.config
+    if (LEVEL.indexOf(level) < LEVEL.indexOf(configLevel)) {
+      return
+    }
+
+    console[level](`${new Date().toISOString()} ${level.toUpperCase()}${prefix ? ` ${prefix}` : ""}`, ...data)
+  }
 }
 
-function mapValues<T extends Record<string | number | symbol, Any>, K extends keyof T, V>(
-  obj: T,
-  fn: (value: T[K], key: K, obj: T) => V,
-): Record<K, V> {
-  return Object.fromEntries(
-    Object.entries(obj).map(([key, value]) => {
-      return [key, fn(value, key as K, obj)]
-    }),
-  ) as Record<K, V>
-}
+type Log = typeof console.log

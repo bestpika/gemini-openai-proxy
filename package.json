@@ -7,7 +7,7 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "start:deno": "deno run --allow-net main_deno.ts",
+    "start:deno": "deno run --allow-net --allow-env main_deno.ts",
     "start:bun": "bun main_bun.ts",
     "start:node": "npm run build:node && node dist/main_node.mjs",
     "build:deno": "deno run --allow-read --allow-env --allow-run build.mjs",
@@ -19,11 +19,11 @@
   },
   "dependencies": {
     "@hono/node-server": "1.8.2",
-    "hono": "4.0.8"
+    "hono": "4.1.2"
   },
   "devDependencies": {
-    "@types/node": "20.11.22",
-    "esbuild": "0.20.1",
+    "@types/node": "20.11.29",
+    "esbuild": "0.20.2",
     "eventsource-parser": "1.1.2"
   }
 }

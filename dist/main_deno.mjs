@@ -1,4 +1,21 @@
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/helper/adapter/index.js
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/helper/adapter/index.js
+var env = (c, runtime) => {
+  const global = globalThis;
+  const globalEnv = global?.process?.env;
+  runtime ??= getRuntimeKey();
+  const runtimeEnvHandlers = {
+    bun: () => globalEnv,
+    node: () => globalEnv,
+    "edge-light": () => globalEnv,
+    deno: () => {
+      return Deno.env.toObject();
+    },
+    workerd: () => c.env,
+    fastly: () => ({}),
+    other: () => ({})
+  };
+  return runtimeEnvHandlers[runtime]();
+};
 var getRuntimeKey = () => {
   const global = globalThis;
   if (global?.Deno !== void 0) {
@@ -22,78 +39,377 @@ var getRuntimeKey = () => {
   return "other";
 };
 
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/middleware/cors/index.js
-var cors = (options) => {
-  const defaults = {
-    origin: "*",
-    allowMethods: ["GET", "HEAD", "PUT", "POST", "DELETE", "PATCH"],
-    allowHeaders: [],
-    exposeHeaders: []
-  };
-  const opts = {
-    ...defaults,
-    ...options
-  };
-  const findAllowOrigin = ((optsOrigin) => {
-    if (typeof optsOrigin === "string") {
-      return () => optsOrigin;
-    } else if (typeof optsOrigin === "function") {
-      return optsOrigin;
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/utils/html.js
+var HtmlEscapedCallbackPhase = {
+  Stringify: 1,
+  BeforeStream: 2,
+  Stream: 3
+};
+var raw = (value, callbacks) => {
+  const escapedString = new String(value);
+  escapedString.isEscaped = true;
+  escapedString.callbacks = callbacks;
+  return escapedString;
+};
+var resolveCallback = async (str, phase, preserveCallbacks, context, buffer) => {
+  const callbacks = str.callbacks;
+  if (!callbacks?.length) {
+    return Promise.resolve(str);
+  }
+  if (buffer) {
+    buffer[0] += str;
+  } else {
+    buffer = [str];
+  }
+  const resStr = Promise.all(callbacks.map((c) => c({ phase, buffer, context }))).then(
+    (res) => Promise.all(
+      res.filter(Boolean).map((str2) => resolveCallback(str2, phase, false, context, buffer))
+    ).then(() => buffer[0])
+  );
+  if (preserveCallbacks) {
+    return raw(await resStr, callbacks);
+  } else {
+    return resStr;
+  }
+};
+
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/context.js
+var TEXT_PLAIN = "text/plain; charset=UTF-8";
+var setHeaders = (headers, map = {}) => {
+  Object.entries(map).forEach(([key, value]) => headers.set(key, value));
+  return headers;
+};
+var Context = class {
+  req;
+  env = {};
+  _var = {};
+  finalized = false;
+  error = void 0;
+  #status = 200;
+  #executionCtx;
+  #headers = void 0;
+  #preparedHeaders = void 0;
+  #res;
+  #isFresh = true;
+  layout = void 0;
+  renderer = (content) => this.html(content);
+  notFoundHandler = () => new Response();
+  constructor(req, options) {
+    this.req = req;
+    if (options) {
+      this.#executionCtx = options.executionCtx;
+      this.env = options.env;
+      if (options.notFoundHandler) {
+        this.notFoundHandler = options.notFoundHandler;
+      }
+    }
+  }
+  get event() {
+    if (this.#executionCtx && "respondWith" in this.#executionCtx) {
+      return this.#executionCtx;
     } else {
-      return (origin) => optsOrigin.includes(origin) ? origin : optsOrigin[0];
+      throw Error("This context has no FetchEvent");
     }
-  })(opts.origin);
-  return async function cors2(c, next) {
-    function set(key, value) {
-      c.res.headers.set(key, value);
+  }
+  get executionCtx() {
+    if (this.#executionCtx) {
+      return this.#executionCtx;
+    } else {
+      throw Error("This context has no ExecutionContext");
     }
-    const allowOrigin = findAllowOrigin(c.req.header("origin") || "");
-    if (allowOrigin) {
-      set("Access-Control-Allow-Origin", allowOrigin);
-    }
-    if (opts.origin !== "*") {
-      set("Vary", "Origin");
-    }
-    if (opts.credentials) {
-      set("Access-Control-Allow-Credentials", "true");
-    }
-    if (opts.exposeHeaders?.length) {
-      set("Access-Control-Expose-Headers", opts.exposeHeaders.join(","));
-    }
-    if (c.req.method === "OPTIONS") {
-      if (opts.maxAge != null) {
-        set("Access-Control-Max-Age", opts.maxAge.toString());
-      }
-      if (opts.allowMethods?.length) {
-        set("Access-Control-Allow-Methods", opts.allowMethods.join(","));
-      }
-      let headers = opts.allowHeaders;
-      if (!headers?.length) {
-        const requestHeaders = c.req.header("Access-Control-Request-Headers");
-        if (requestHeaders) {
-          headers = requestHeaders.split(/\s*,\s*/);
+  }
+  get res() {
+    this.#isFresh = false;
+    return this.#res ||= new Response("404 Not Found", { status: 404 });
+  }
+  set res(_res) {
+    this.#isFresh = false;
+    if (this.#res && _res) {
+      this.#res.headers.delete("content-type");
+      for (const [k, v] of this.#res.headers.entries()) {
+        if (k === "set-cookie") {
+          const cookies = this.#res.headers.getSetCookie();
+          _res.headers.delete("set-cookie");
+          for (const cookie of cookies) {
+            _res.headers.append("set-cookie", cookie);
+          }
+        } else {
+          _res.headers.set(k, v);
         }
       }
-      if (headers?.length) {
-        set("Access-Control-Allow-Headers", headers.join(","));
-        c.res.headers.append("Vary", "Access-Control-Request-Headers");
+    }
+    this.#res = _res;
+    this.finalized = true;
+  }
+  render = (...args) => this.renderer(...args);
+  setLayout = (layout) => this.layout = layout;
+  getLayout = () => this.layout;
+  setRenderer = (renderer) => {
+    this.renderer = renderer;
+  };
+  header = (name, value, options) => {
+    if (value === void 0) {
+      if (this.#headers) {
+        this.#headers.delete(name);
+      } else if (this.#preparedHeaders) {
+        delete this.#preparedHeaders[name.toLocaleLowerCase()];
       }
-      c.res.headers.delete("Content-Length");
-      c.res.headers.delete("Content-Type");
-      return new Response(null, {
-        headers: c.res.headers,
-        status: 204,
-        statusText: c.res.statusText
+      if (this.finalized) {
+        this.res.headers.delete(name);
+      }
+      return;
+    }
+    if (options?.append) {
+      if (!this.#headers) {
+        this.#isFresh = false;
+        this.#headers = new Headers(this.#preparedHeaders);
+        this.#preparedHeaders = {};
+      }
+      this.#headers.append(name, value);
+    } else {
+      if (this.#headers) {
+        this.#headers.set(name, value);
+      } else {
+        this.#preparedHeaders ??= {};
+        this.#preparedHeaders[name.toLowerCase()] = value;
+      }
+    }
+    if (this.finalized) {
+      if (options?.append) {
+        this.res.headers.append(name, value);
+      } else {
+        this.res.headers.set(name, value);
+      }
+    }
+  };
+  status = (status) => {
+    this.#isFresh = false;
+    this.#status = status;
+  };
+  set = (key, value) => {
+    this._var ??= {};
+    this._var[key] = value;
+  };
+  get = (key) => {
+    return this._var ? this._var[key] : void 0;
+  };
+  get var() {
+    return { ...this._var };
+  }
+  newResponse = (data, arg, headers) => {
+    if (this.#isFresh && !headers && !arg && this.#status === 200) {
+      return new Response(data, {
+        headers: this.#preparedHeaders
       });
     }
-    await next();
+    if (arg && typeof arg !== "number") {
+      const header = new Headers(arg.headers);
+      if (this.#headers) {
+        this.#headers.forEach((v, k) => {
+          header.set(k, v);
+        });
+      }
+      const headers2 = setHeaders(header, this.#preparedHeaders);
+      return new Response(data, {
+        headers: headers2,
+        status: arg.status ?? this.#status
+      });
+    }
+    const status = typeof arg === "number" ? arg : this.#status;
+    this.#preparedHeaders ??= {};
+    this.#headers ??= new Headers();
+    setHeaders(this.#headers, this.#preparedHeaders);
+    if (this.#res) {
+      this.#res.headers.forEach((v, k) => {
+        this.#headers?.set(k, v);
+      });
+      setHeaders(this.#headers, this.#preparedHeaders);
+    }
+    headers ??= {};
+    for (const [k, v] of Object.entries(headers)) {
+      if (typeof v === "string") {
+        this.#headers.set(k, v);
+      } else {
+        this.#headers.delete(k);
+        for (const v2 of v) {
+          this.#headers.append(k, v2);
+        }
+      }
+    }
+    return new Response(data, {
+      status,
+      headers: this.#headers
+    });
+  };
+  body = (data, arg, headers) => {
+    return typeof arg === "number" ? this.newResponse(data, arg, headers) : this.newResponse(data, arg);
+  };
+  text = (text, arg, headers) => {
+    if (!this.#preparedHeaders) {
+      if (this.#isFresh && !headers && !arg) {
+        return new Response(text);
+      }
+      this.#preparedHeaders = {};
+    }
+    this.#preparedHeaders["content-type"] = TEXT_PLAIN;
+    return typeof arg === "number" ? this.newResponse(text, arg, headers) : this.newResponse(text, arg);
+  };
+  json = (object, arg, headers) => {
+    const body = JSON.stringify(object);
+    this.#preparedHeaders ??= {};
+    this.#preparedHeaders["content-type"] = "application/json; charset=UTF-8";
+    return typeof arg === "number" ? this.newResponse(body, arg, headers) : this.newResponse(body, arg);
+  };
+  html = (html, arg, headers) => {
+    this.#preparedHeaders ??= {};
+    this.#preparedHeaders["content-type"] = "text/html; charset=UTF-8";
+    if (typeof html === "object") {
+      if (!(html instanceof Promise)) {
+        html = html.toString();
+      }
+      if (html instanceof Promise) {
+        return html.then((html2) => resolveCallback(html2, HtmlEscapedCallbackPhase.Stringify, false, {})).then((html2) => {
+          return typeof arg === "number" ? this.newResponse(html2, arg, headers) : this.newResponse(html2, arg);
+        });
+      }
+    }
+    return typeof arg === "number" ? this.newResponse(html, arg, headers) : this.newResponse(html, arg);
+  };
+  redirect = (location, status = 302) => {
+    this.#headers ??= new Headers();
+    this.#headers.set("Location", location);
+    return this.newResponse(null, status);
+  };
+  notFound = () => {
+    return this.notFoundHandler(this);
   };
 };
 
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/utils/url.js
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/compose.js
+var compose = (middleware, onError, onNotFound) => {
+  return (context, next) => {
+    let index = -1;
+    return dispatch(0);
+    async function dispatch(i) {
+      if (i <= index) {
+        throw new Error("next() called multiple times");
+      }
+      index = i;
+      let res;
+      let isError = false;
+      let handler;
+      if (middleware[i]) {
+        handler = middleware[i][0][0];
+        if (context instanceof Context) {
+          context.req.routeIndex = i;
+        }
+      } else {
+        handler = i === middleware.length && next || void 0;
+      }
+      if (!handler) {
+        if (context instanceof Context && context.finalized === false && onNotFound) {
+          res = await onNotFound(context);
+        }
+      } else {
+        try {
+          res = await handler(context, () => {
+            return dispatch(i + 1);
+          });
+        } catch (err) {
+          if (err instanceof Error && context instanceof Context && onError) {
+            context.error = err;
+            res = await onError(err, context);
+            isError = true;
+          } else {
+            throw err;
+          }
+        }
+      }
+      if (res && (context.finalized === false || isError)) {
+        context.res = res;
+      }
+      return context;
+    }
+  };
+};
+
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/http-exception.js
+var HTTPException = class extends Error {
+  res;
+  status;
+  constructor(status = 500, options) {
+    super(options?.message, { cause: options?.cause });
+    this.res = options?.res;
+    this.status = status;
+  }
+  getResponse() {
+    if (this.res) {
+      return this.res;
+    }
+    return new Response(this.message, {
+      status: this.status
+    });
+  }
+};
+
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/utils/body.js
+var parseBody = async (request, options = { all: false }) => {
+  const headers = request instanceof HonoRequest ? request.raw.headers : request.headers;
+  const contentType = headers.get("Content-Type");
+  if (isFormDataContent(contentType)) {
+    return parseFormData(request, options);
+  }
+  return {};
+};
+function isFormDataContent(contentType) {
+  if (contentType === null) {
+    return false;
+  }
+  return contentType.startsWith("multipart/form-data") || contentType.startsWith("application/x-www-form-urlencoded");
+}
+async function parseFormData(request, options) {
+  const formData = await request.formData();
+  if (formData) {
+    return convertFormDataToBodyData(formData, options);
+  }
+  return {};
+}
+function convertFormDataToBodyData(formData, options) {
+  const form = {};
+  formData.forEach((value, key) => {
+    const shouldParseAllValues = options.all || key.endsWith("[]");
+    if (!shouldParseAllValues) {
+      form[key] = value;
+    } else {
+      handleParsingAllValues(form, key, value);
+    }
+  });
+  return form;
+}
+var handleParsingAllValues = (form, key, value) => {
+  if (form[key] && isArrayField(form[key])) {
+    appendToExistingArray(form[key], value);
+  } else if (form[key]) {
+    convertToNewArray(form, key, value);
+  } else {
+    form[key] = value;
+  }
+};
+function isArrayField(field) {
+  return Array.isArray(field);
+}
+var appendToExistingArray = (arr, value) => {
+  arr.push(value);
+};
+var convertToNewArray = (form, key, value) => {
+  form[key] = [form[key], value];
+};
+
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/utils/url.js
 var getPath = (request) => {
-  const match = request.url.match(/^https?:\/\/[^/]+(\/[^?]*)/);
-  return match ? match[1] : "";
+  const url = request.url;
+  const queryIndex = url.indexOf("?", 8);
+  return url.slice(url.indexOf("/", 8), queryIndex === -1 ? void 0 : queryIndex);
 };
 var getQueryStrings = (url) => {
   const queryIndex = url.indexOf("?", 8);
@@ -158,7 +474,7 @@ var _getQueryParam = (url, key, multiple) => {
     }
   }
   const results = {};
-  encoded ?? (encoded = /[%+]/.test(url));
+  encoded ??= /[%+]/.test(url);
   let keyIndex = url.indexOf("?", 8);
   while (keyIndex !== -1) {
     const nextKeyIndex = url.indexOf("&", keyIndex + 1);
@@ -193,7 +509,7 @@ var _getQueryParam = (url, key, multiple) => {
       ;
       results[name].push(value);
     } else {
-      results[name] ?? (results[name] = value);
+      results[name] ??= value;
     }
   }
   return key ? results[key] : results;
@@ -204,574 +520,33 @@ var getQueryParams = (url, key) => {
 };
 var decodeURIComponent_ = decodeURIComponent;
 
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/middleware/logger/index.js
-var humanize = (times) => {
-  const [delimiter, separator] = [",", "."];
-  const orderTimes = times.map((v) => v.replace(/(\d)(?=(\d\d\d)+(?!\d))/g, "$1" + delimiter));
-  return orderTimes.join(separator);
-};
-var time = (start) => {
-  const delta = Date.now() - start;
-  return humanize([delta < 1e3 ? delta + "ms" : Math.round(delta / 1e3) + "s"]);
-};
-var colorStatus = (status) => {
-  const out = {
-    7: `\x1B[35m${status}\x1B[0m`,
-    5: `\x1B[31m${status}\x1B[0m`,
-    4: `\x1B[33m${status}\x1B[0m`,
-    3: `\x1B[36m${status}\x1B[0m`,
-    2: `\x1B[32m${status}\x1B[0m`,
-    1: `\x1B[32m${status}\x1B[0m`,
-    0: `\x1B[33m${status}\x1B[0m`
-  };
-  const calculateStatus = status / 100 | 0;
-  return out[calculateStatus];
-};
-function log(fn, prefix, method, path, status = 0, elapsed) {
-  const out = prefix === "<--" ? `  ${prefix} ${method} ${path}` : `  ${prefix} ${method} ${path} ${colorStatus(status)} ${elapsed}`;
-  fn(out);
-}
-var logger = (fn = console.log) => {
-  return async function logger2(c, next) {
-    const { method } = c.req;
-    const path = getPath(c.req.raw);
-    log(fn, "<--", method, path);
-    const start = Date.now();
-    await next();
-    log(fn, "-->", method, path, c.res.status, time(start));
-  };
-};
-
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/utils/html.js
-var HtmlEscapedCallbackPhase = {
-  Stringify: 1,
-  BeforeStream: 2,
-  Stream: 3
-};
-var raw = (value, callbacks) => {
-  const escapedString = new String(value);
-  escapedString.isEscaped = true;
-  escapedString.callbacks = callbacks;
-  return escapedString;
-};
-var resolveCallback = async (str, phase, preserveCallbacks, context, buffer) => {
-  const callbacks = str.callbacks;
-  if (!callbacks?.length) {
-    return Promise.resolve(str);
-  }
-  if (buffer) {
-    buffer[0] += str;
-  } else {
-    buffer = [str];
-  }
-  const resStr = Promise.all(callbacks.map((c) => c({ phase, buffer, context }))).then(
-    (res) => Promise.all(
-      res.filter(Boolean).map((str2) => resolveCallback(str2, phase, false, context, buffer))
-    ).then(() => buffer[0])
-  );
-  if (preserveCallbacks) {
-    return raw(await resStr, callbacks);
-  } else {
-    return resStr;
-  }
-};
-
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/context.js
-var __accessCheck = (obj, member, msg) => {
-  if (!member.has(obj))
-    throw TypeError("Cannot " + msg);
-};
-var __privateGet = (obj, member, getter) => {
-  __accessCheck(obj, member, "read from private field");
-  return getter ? getter.call(obj) : member.get(obj);
-};
-var __privateAdd = (obj, member, value) => {
-  if (member.has(obj))
-    throw TypeError("Cannot add the same private member more than once");
-  member instanceof WeakSet ? member.add(obj) : member.set(obj, value);
-};
-var __privateSet = (obj, member, value, setter) => {
-  __accessCheck(obj, member, "write to private field");
-  setter ? setter.call(obj, value) : member.set(obj, value);
-  return value;
-};
-var TEXT_PLAIN = "text/plain; charset=UTF-8";
-var setHeaders = (headers, map = {}) => {
-  Object.entries(map).forEach(([key, value]) => headers.set(key, value));
-  return headers;
-};
-var _status;
-var _executionCtx;
-var _headers;
-var _preparedHeaders;
-var _res;
-var _isFresh;
-var Context = class {
-  constructor(req, options) {
-    this.env = {};
-    this._var = {};
-    this.finalized = false;
-    this.error = void 0;
-    __privateAdd(this, _status, 200);
-    __privateAdd(this, _executionCtx, void 0);
-    __privateAdd(this, _headers, void 0);
-    __privateAdd(this, _preparedHeaders, void 0);
-    __privateAdd(this, _res, void 0);
-    __privateAdd(this, _isFresh, true);
-    this.layout = void 0;
-    this.renderer = (content) => this.html(content);
-    this.notFoundHandler = () => new Response();
-    this.render = (...args) => this.renderer(...args);
-    this.setLayout = (layout) => this.layout = layout;
-    this.getLayout = () => this.layout;
-    this.setRenderer = (renderer) => {
-      this.renderer = renderer;
-    };
-    this.header = (name, value, options2) => {
-      if (value === void 0) {
-        if (__privateGet(this, _headers)) {
-          __privateGet(this, _headers).delete(name);
-        } else if (__privateGet(this, _preparedHeaders)) {
-          delete __privateGet(this, _preparedHeaders)[name.toLocaleLowerCase()];
-        }
-        if (this.finalized) {
-          this.res.headers.delete(name);
-        }
-        return;
-      }
-      if (options2?.append) {
-        if (!__privateGet(this, _headers)) {
-          __privateSet(this, _isFresh, false);
-          __privateSet(this, _headers, new Headers(__privateGet(this, _preparedHeaders)));
-          __privateSet(this, _preparedHeaders, {});
-        }
-        __privateGet(this, _headers).append(name, value);
-      } else {
-        if (__privateGet(this, _headers)) {
-          __privateGet(this, _headers).set(name, value);
-        } else {
-          __privateGet(this, _preparedHeaders) ?? __privateSet(this, _preparedHeaders, {});
-          __privateGet(this, _preparedHeaders)[name.toLowerCase()] = value;
-        }
-      }
-      if (this.finalized) {
-        if (options2?.append) {
-          this.res.headers.append(name, value);
-        } else {
-          this.res.headers.set(name, value);
-        }
-      }
-    };
-    this.status = (status) => {
-      __privateSet(this, _isFresh, false);
-      __privateSet(this, _status, status);
-    };
-    this.set = (key, value) => {
-      this._var ?? (this._var = {});
-      this._var[key] = value;
-    };
-    this.get = (key) => {
-      return this._var ? this._var[key] : void 0;
-    };
-    this.newResponse = (data, arg, headers) => {
-      if (__privateGet(this, _isFresh) && !headers && !arg && __privateGet(this, _status) === 200) {
-        return new Response(data, {
-          headers: __privateGet(this, _preparedHeaders)
-        });
-      }
-      if (arg && typeof arg !== "number") {
-        const headers2 = setHeaders(new Headers(arg.headers), __privateGet(this, _preparedHeaders));
-        return new Response(data, {
-          headers: headers2,
-          status: arg.status ?? __privateGet(this, _status)
-        });
-      }
-      const status = typeof arg === "number" ? arg : __privateGet(this, _status);
-      __privateGet(this, _preparedHeaders) ?? __privateSet(this, _preparedHeaders, {});
-      __privateGet(this, _headers) ?? __privateSet(this, _headers, new Headers());
-      setHeaders(__privateGet(this, _headers), __privateGet(this, _preparedHeaders));
-      if (__privateGet(this, _res)) {
-        __privateGet(this, _res).headers.forEach((v, k) => {
-          __privateGet(this, _headers)?.set(k, v);
-        });
-        setHeaders(__privateGet(this, _headers), __privateGet(this, _preparedHeaders));
-      }
-      headers ?? (headers = {});
-      for (const [k, v] of Object.entries(headers)) {
-        if (typeof v === "string") {
-          __privateGet(this, _headers).set(k, v);
-        } else {
-          __privateGet(this, _headers).delete(k);
-          for (const v2 of v) {
-            __privateGet(this, _headers).append(k, v2);
-          }
-        }
-      }
-      return new Response(data, {
-        status,
-        headers: __privateGet(this, _headers)
-      });
-    };
-    this.body = (data, arg, headers) => {
-      return typeof arg === "number" ? this.newResponse(data, arg, headers) : this.newResponse(data, arg);
-    };
-    this.text = (text, arg, headers) => {
-      if (!__privateGet(this, _preparedHeaders)) {
-        if (__privateGet(this, _isFresh) && !headers && !arg) {
-          return new Response(text);
-        }
-        __privateSet(this, _preparedHeaders, {});
-      }
-      __privateGet(this, _preparedHeaders)["content-type"] = TEXT_PLAIN;
-      return typeof arg === "number" ? this.newResponse(text, arg, headers) : this.newResponse(text, arg);
-    };
-    this.json = (object, arg, headers) => {
-      const body = JSON.stringify(object);
-      __privateGet(this, _preparedHeaders) ?? __privateSet(this, _preparedHeaders, {});
-      __privateGet(this, _preparedHeaders)["content-type"] = "application/json; charset=UTF-8";
-      return typeof arg === "number" ? this.newResponse(body, arg, headers) : this.newResponse(body, arg);
-    };
-    this.html = (html, arg, headers) => {
-      __privateGet(this, _preparedHeaders) ?? __privateSet(this, _preparedHeaders, {});
-      __privateGet(this, _preparedHeaders)["content-type"] = "text/html; charset=UTF-8";
-      if (typeof html === "object") {
-        if (!(html instanceof Promise)) {
-          html = html.toString();
-        }
-        if (html instanceof Promise) {
-          return html.then((html2) => resolveCallback(html2, HtmlEscapedCallbackPhase.Stringify, false, {})).then((html2) => {
-            return typeof arg === "number" ? this.newResponse(html2, arg, headers) : this.newResponse(html2, arg);
-          });
-        }
-      }
-      return typeof arg === "number" ? this.newResponse(html, arg, headers) : this.newResponse(html, arg);
-    };
-    this.redirect = (location, status = 302) => {
-      __privateGet(this, _headers) ?? __privateSet(this, _headers, new Headers());
-      __privateGet(this, _headers).set("Location", location);
-      return this.newResponse(null, status);
-    };
-    this.notFound = () => {
-      return this.notFoundHandler(this);
-    };
-    this.req = req;
-    if (options) {
-      __privateSet(this, _executionCtx, options.executionCtx);
-      this.env = options.env;
-      if (options.notFoundHandler) {
-        this.notFoundHandler = options.notFoundHandler;
-      }
-    }
-  }
-  get event() {
-    if (__privateGet(this, _executionCtx) && "respondWith" in __privateGet(this, _executionCtx)) {
-      return __privateGet(this, _executionCtx);
-    } else {
-      throw Error("This context has no FetchEvent");
-    }
-  }
-  get executionCtx() {
-    if (__privateGet(this, _executionCtx)) {
-      return __privateGet(this, _executionCtx);
-    } else {
-      throw Error("This context has no ExecutionContext");
-    }
-  }
-  get res() {
-    __privateSet(this, _isFresh, false);
-    return __privateGet(this, _res) || __privateSet(this, _res, new Response("404 Not Found", { status: 404 }));
-  }
-  set res(_res2) {
-    __privateSet(this, _isFresh, false);
-    if (__privateGet(this, _res) && _res2) {
-      __privateGet(this, _res).headers.delete("content-type");
-      for (const [k, v] of __privateGet(this, _res).headers.entries()) {
-        if (k === "set-cookie") {
-          const cookies = __privateGet(this, _res).headers.getSetCookie();
-          _res2.headers.delete("set-cookie");
-          for (const cookie of cookies) {
-            _res2.headers.append("set-cookie", cookie);
-          }
-        } else {
-          _res2.headers.set(k, v);
-        }
-      }
-    }
-    __privateSet(this, _res, _res2);
-    this.finalized = true;
-  }
-  get var() {
-    return { ...this._var };
-  }
-};
-_status = /* @__PURE__ */ new WeakMap();
-_executionCtx = /* @__PURE__ */ new WeakMap();
-_headers = /* @__PURE__ */ new WeakMap();
-_preparedHeaders = /* @__PURE__ */ new WeakMap();
-_res = /* @__PURE__ */ new WeakMap();
-_isFresh = /* @__PURE__ */ new WeakMap();
-
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/middleware/timing/index.js
-var getTime = () => {
-  try {
-    return performance.now();
-  } catch {
-  }
-  return Date.now();
-};
-var timing = (config) => {
-  const options = {
-    ...{
-      total: true,
-      enabled: true,
-      totalDescription: "Total Response Time",
-      autoEnd: true,
-      crossOrigin: false
-    },
-    ...config
-  };
-  return async function timing2(c, next) {
-    const headers = [];
-    const timers = /* @__PURE__ */ new Map();
-    c.set("metric", { headers, timers });
-    if (options.total) {
-      startTime(c, "total", options.totalDescription);
-    }
-    await next();
-    if (options.total) {
-      endTime(c, "total");
-    }
-    if (options.autoEnd) {
-      timers.forEach((_, key) => endTime(c, key));
-    }
-    const enabled = typeof options.enabled === "function" ? options.enabled(c) : options.enabled;
-    if (enabled) {
-      c.res.headers.append("Server-Timing", headers.join(","));
-      if (options.crossOrigin) {
-        c.res.headers.append(
-          "Timing-Allow-Origin",
-          typeof options.crossOrigin === "string" ? options.crossOrigin : "*"
-        );
-      }
-    }
-  };
-};
-var setMetric = (c, name, valueDescription, description, precision) => {
-  const metrics = c.get("metric");
-  if (!metrics) {
-    console.warn("Metrics not initialized! Please add the `timing()` middleware to this route!");
-    return;
-  }
-  if (typeof valueDescription === "number") {
-    const dur = valueDescription.toFixed(precision || 1);
-    const metric = description ? `${name};dur=${dur};desc="${description}"` : `${name};dur=${dur}`;
-    metrics.headers.push(metric);
-  } else {
-    const metric = valueDescription ? `${name};desc="${valueDescription}"` : `${name}`;
-    metrics.headers.push(metric);
-  }
-};
-var startTime = (c, name, description) => {
-  const metrics = c.get("metric");
-  if (!metrics) {
-    console.warn("Metrics not initialized! Please add the `timing()` middleware to this route!");
-    return;
-  }
-  metrics.timers.set(name, { description, start: getTime() });
-};
-var endTime = (c, name, precision) => {
-  const metrics = c.get("metric");
-  if (!metrics) {
-    console.warn("Metrics not initialized! Please add the `timing()` middleware to this route!");
-    return;
-  }
-  const timer = metrics.timers.get(name);
-  if (!timer) {
-    console.warn(`Timer "${name}" does not exist!`);
-    return;
-  }
-  const { description, start } = timer;
-  const duration = getTime() - start;
-  setMetric(c, name, duration, description, precision);
-  metrics.timers.delete(name);
-};
-
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/compose.js
-var compose = (middleware, onError, onNotFound) => {
-  return (context, next) => {
-    let index = -1;
-    return dispatch(0);
-    async function dispatch(i) {
-      if (i <= index) {
-        throw new Error("next() called multiple times");
-      }
-      index = i;
-      let res;
-      let isError = false;
-      let handler;
-      if (middleware[i]) {
-        handler = middleware[i][0][0];
-        if (context instanceof Context) {
-          context.req.routeIndex = i;
-        }
-      } else {
-        handler = i === middleware.length && next || void 0;
-      }
-      if (!handler) {
-        if (context instanceof Context && context.finalized === false && onNotFound) {
-          res = await onNotFound(context);
-        }
-      } else {
-        try {
-          res = await handler(context, () => {
-            return dispatch(i + 1);
-          });
-        } catch (err) {
-          if (err instanceof Error && context instanceof Context && onError) {
-            context.error = err;
-            res = await onError(err, context);
-            isError = true;
-          } else {
-            throw err;
-          }
-        }
-      }
-      if (res && (context.finalized === false || isError)) {
-        context.res = res;
-      }
-      return context;
-    }
-  };
-};
-
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/http-exception.js
-var HTTPException = class extends Error {
-  constructor(status = 500, options) {
-    super(options?.message);
-    this.res = options?.res;
-    this.status = status;
-  }
-  getResponse() {
-    if (this.res) {
-      return this.res;
-    }
-    return new Response(this.message, {
-      status: this.status
-    });
-  }
-};
-
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/utils/body.js
-var parseBody = async (request, options = { all: false }) => {
-  const headers = request instanceof HonoRequest ? request.raw.headers : request.headers;
-  const contentType = headers.get("Content-Type");
-  if (isFormDataContent(contentType)) {
-    return parseFormData(request, options);
-  }
-  return {};
-};
-function isFormDataContent(contentType) {
-  if (contentType === null) {
-    return false;
-  }
-  return contentType.startsWith("multipart/form-data") || contentType.startsWith("application/x-www-form-urlencoded");
-}
-async function parseFormData(request, options) {
-  const formData = await request.formData();
-  if (formData) {
-    return convertFormDataToBodyData(formData, options);
-  }
-  return {};
-}
-function convertFormDataToBodyData(formData, options) {
-  const form = {};
-  formData.forEach((value, key) => {
-    const shouldParseAllValues = options.all || key.endsWith("[]");
-    if (!shouldParseAllValues) {
-      form[key] = value;
-    } else {
-      handleParsingAllValues(form, key, value);
-    }
-  });
-  return form;
-}
-var handleParsingAllValues = (form, key, value) => {
-  if (form[key] && isArrayField(form[key])) {
-    appendToExistingArray(form[key], value);
-  } else if (form[key]) {
-    convertToNewArray(form, key, value);
-  } else {
-    form[key] = value;
-  }
-};
-function isArrayField(field) {
-  return Array.isArray(field);
-}
-var appendToExistingArray = (arr, value) => {
-  arr.push(value);
-};
-var convertToNewArray = (form, key, value) => {
-  form[key] = [form[key], value];
-};
-
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/request.js
-var __accessCheck2 = (obj, member, msg) => {
-  if (!member.has(obj))
-    throw TypeError("Cannot " + msg);
-};
-var __privateGet2 = (obj, member, getter) => {
-  __accessCheck2(obj, member, "read from private field");
-  return getter ? getter.call(obj) : member.get(obj);
-};
-var __privateAdd2 = (obj, member, value) => {
-  if (member.has(obj))
-    throw TypeError("Cannot add the same private member more than once");
-  member instanceof WeakSet ? member.add(obj) : member.set(obj, value);
-};
-var __privateSet2 = (obj, member, value, setter) => {
-  __accessCheck2(obj, member, "write to private field");
-  setter ? setter.call(obj, value) : member.set(obj, value);
-  return value;
-};
-var _validatedData;
-var _matchResult;
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/request.js
 var HonoRequest = class {
+  raw;
+  #validatedData;
+  #matchResult;
+  routeIndex = 0;
+  path;
+  bodyCache = {};
   constructor(request, path = "/", matchResult = [[]]) {
-    __privateAdd2(this, _validatedData, void 0);
-    __privateAdd2(this, _matchResult, void 0);
-    this.routeIndex = 0;
-    this.bodyCache = {};
-    this.cachedBody = (key) => {
-      const { bodyCache, raw: raw2 } = this;
-      const cachedBody = bodyCache[key];
-      if (cachedBody) {
-        return cachedBody;
-      }
-      if (bodyCache.arrayBuffer) {
-        return (async () => {
-          return await new Response(bodyCache.arrayBuffer)[key]();
-        })();
-      }
-      return bodyCache[key] = raw2[key]();
-    };
     this.raw = request;
     this.path = path;
-    __privateSet2(this, _matchResult, matchResult);
-    __privateSet2(this, _validatedData, {});
+    this.#matchResult = matchResult;
+    this.#validatedData = {};
   }
   param(key) {
     return key ? this.getDecodedParam(key) : this.getAllDecodedParams();
   }
   getDecodedParam(key) {
-    const paramKey = __privateGet2(this, _matchResult)[0][this.routeIndex][1][key];
+    const paramKey = this.#matchResult[0][this.routeIndex][1][key];
     const param = this.getParamValue(paramKey);
     return param ? /\%/.test(param) ? decodeURIComponent_(param) : param : void 0;
   }
   getAllDecodedParams() {
     const decoded = {};
-    const keys = Object.keys(__privateGet2(this, _matchResult)[0][this.routeIndex][1]);
+    const keys = Object.keys(this.#matchResult[0][this.routeIndex][1]);
     for (const key of keys) {
-      const value = this.getParamValue(__privateGet2(this, _matchResult)[0][this.routeIndex][1][key]);
+      const value = this.getParamValue(this.#matchResult[0][this.routeIndex][1][key]);
       if (value && typeof value === "string") {
         decoded[key] = /\%/.test(value) ? decodeURIComponent_(value) : value;
       }
@@ -779,7 +554,7 @@ var HonoRequest = class {
     return decoded;
   }
   getParamValue(paramKey) {
-    return __privateGet2(this, _matchResult)[1] ? __privateGet2(this, _matchResult)[1][paramKey] : paramKey;
+    return this.#matchResult[1] ? this.#matchResult[1][paramKey] : paramKey;
   }
   query(key) {
     return getQueryParam(this.url, key);
@@ -805,6 +580,19 @@ var HonoRequest = class {
     this.bodyCache.parsedBody = parsedBody;
     return parsedBody;
   }
+  cachedBody = (key) => {
+    const { bodyCache, raw: raw2 } = this;
+    const cachedBody = bodyCache[key];
+    if (cachedBody) {
+      return cachedBody;
+    }
+    if (bodyCache.arrayBuffer) {
+      return (async () => {
+        return await new Response(bodyCache.arrayBuffer)[key]();
+      })();
+    }
+    return bodyCache[key] = raw2[key]();
+  };
   json() {
     return this.cachedBody("json");
   }
@@ -821,10 +609,10 @@ var HonoRequest = class {
     return this.cachedBody("formData");
   }
   addValidatedData(target, data) {
-    __privateGet2(this, _validatedData)[target] = data;
+    this.#validatedData[target] = data;
   }
   valid(target) {
-    return __privateGet2(this, _validatedData)[target];
+    return this.#validatedData[target];
   }
   get url() {
     return this.raw.url;
@@ -833,41 +621,21 @@ var HonoRequest = class {
     return this.raw.method;
   }
   get matchedRoutes() {
-    return __privateGet2(this, _matchResult)[0].map(([[, route]]) => route);
+    return this.#matchResult[0].map(([[, route]]) => route);
   }
   get routePath() {
-    return __privateGet2(this, _matchResult)[0].map(([[, route]]) => route)[this.routeIndex].path;
+    return this.#matchResult[0].map(([[, route]]) => route)[this.routeIndex].path;
   }
 };
-_validatedData = /* @__PURE__ */ new WeakMap();
-_matchResult = /* @__PURE__ */ new WeakMap();
 
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/router.js
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/router.js
 var METHOD_NAME_ALL = "ALL";
 var METHOD_NAME_ALL_LOWERCASE = "all";
 var METHODS = ["get", "post", "put", "delete", "options", "patch"];
 var UnsupportedPathError = class extends Error {
 };
 
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/hono-base.js
-var __accessCheck3 = (obj, member, msg) => {
-  if (!member.has(obj))
-    throw TypeError("Cannot " + msg);
-};
-var __privateGet3 = (obj, member, getter) => {
-  __accessCheck3(obj, member, "read from private field");
-  return getter ? getter.call(obj) : member.get(obj);
-};
-var __privateAdd3 = (obj, member, value) => {
-  if (member.has(obj))
-    throw TypeError("Cannot add the same private member more than once");
-  member instanceof WeakSet ? member.add(obj) : member.set(obj, value);
-};
-var __privateSet3 = (obj, member, value, setter) => {
-  __accessCheck3(obj, member, "write to private field");
-  setter ? setter.call(obj, value) : member.set(obj, value);
-  return value;
-};
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/hono-base.js
 var COMPOSED_HANDLER = Symbol("composedHandler");
 function defineDynamicClass() {
   return class {
@@ -883,54 +651,25 @@ var errorHandler = (err, c) => {
   console.error(err);
   return c.text("Internal Server Error", 500);
 };
-var _path;
-var _Hono = class extends defineDynamicClass() {
+var Hono = class extends defineDynamicClass() {
+  router;
+  getPath;
+  _basePath = "/";
+  #path = "/";
+  routes = [];
   constructor(options = {}) {
     super();
-    this._basePath = "/";
-    __privateAdd3(this, _path, "/");
-    this.routes = [];
-    this.notFoundHandler = notFoundHandler;
-    this.errorHandler = errorHandler;
-    this.onError = (handler) => {
-      this.errorHandler = handler;
-      return this;
-    };
-    this.notFound = (handler) => {
-      this.notFoundHandler = handler;
-      return this;
-    };
-    this.fetch = (request, Env, executionCtx) => {
-      return this.dispatch(request, executionCtx, Env, request.method);
-    };
-    this.request = (input, requestInit, Env, executionCtx) => {
-      if (input instanceof Request) {
-        if (requestInit !== void 0) {
-          input = new Request(input, requestInit);
-        }
-        return this.fetch(input, Env, executionCtx);
-      }
-      input = input.toString();
-      const path = /^https?:\/\//.test(input) ? input : `http://localhost${mergePath("/", input)}`;
-      const req = new Request(path, requestInit);
-      return this.fetch(req, Env, executionCtx);
-    };
-    this.fire = () => {
-      addEventListener("fetch", (event) => {
-        event.respondWith(this.dispatch(event.request, event, void 0, event.request.method));
-      });
-    };
     const allMethods = [...METHODS, METHOD_NAME_ALL_LOWERCASE];
     allMethods.map((method) => {
       this[method] = (args1, ...args) => {
         if (typeof args1 === "string") {
-          __privateSet3(this, _path, args1);
+          this.#path = args1;
         } else {
-          this.addRoute(method, __privateGet3(this, _path), args1);
+          this.addRoute(method, this.#path, args1);
         }
         args.map((handler) => {
           if (typeof handler !== "string") {
-            this.addRoute(method, __privateGet3(this, _path), handler);
+            this.addRoute(method, this.#path, handler);
           }
         });
         return this;
@@ -941,10 +680,10 @@ var _Hono = class extends defineDynamicClass() {
         return this;
       }
       for (const p of [path].flat()) {
-        __privateSet3(this, _path, p);
+        this.#path = p;
         for (const m of [method].flat()) {
           handlers.map((handler) => {
-            this.addRoute(m.toUpperCase(), __privateGet3(this, _path), handler);
+            this.addRoute(m.toUpperCase(), this.#path, handler);
           });
         }
       }
@@ -952,13 +691,13 @@ var _Hono = class extends defineDynamicClass() {
     };
     this.use = (arg1, ...handlers) => {
       if (typeof arg1 === "string") {
-        __privateSet3(this, _path, arg1);
+        this.#path = arg1;
       } else {
-        __privateSet3(this, _path, "*");
+        this.#path = "*";
         handlers.unshift(arg1);
       }
       handlers.map((handler) => {
-        this.addRoute(METHOD_NAME_ALL, __privateGet3(this, _path), handler);
+        this.addRoute(METHOD_NAME_ALL, this.#path, handler);
       });
       return this;
     };
@@ -968,13 +707,15 @@ var _Hono = class extends defineDynamicClass() {
     this.getPath = strict ? options.getPath ?? getPath : getPathNoStrict;
   }
   clone() {
-    const clone = new _Hono({
+    const clone = new Hono({
       router: this.router,
       getPath: this.getPath
     });
     clone.routes = this.routes;
     return clone;
   }
+  notFoundHandler = notFoundHandler;
+  errorHandler = errorHandler;
   route(path, app2) {
     const subApp = this.basePath(path);
     if (!app2) {
@@ -997,6 +738,14 @@ var _Hono = class extends defineDynamicClass() {
     subApp._basePath = mergePath(this._basePath, path);
     return subApp;
   }
+  onError = (handler) => {
+    this.errorHandler = handler;
+    return this;
+  };
+  notFound = (handler) => {
+    this.notFoundHandler = handler;
+    return this;
+  };
   mount(path, applicationHandler, optionHandler) {
     const mergedPath = mergePath(this._basePath, path);
     const pathPrefixLength = mergedPath === "/" ? 0 : mergedPath.length;
@@ -1040,14 +789,14 @@ var _Hono = class extends defineDynamicClass() {
     }
     throw err;
   }
-  dispatch(request, executionCtx, env, method) {
+  dispatch(request, executionCtx, env2, method) {
     if (method === "HEAD") {
-      return (async () => new Response(null, await this.dispatch(request, executionCtx, env, "GET")))();
+      return (async () => new Response(null, await this.dispatch(request, executionCtx, env2, "GET")))();
     }
-    const path = this.getPath(request, { env });
+    const path = this.getPath(request, { env: env2 });
     const matchResult = this.matchRoute(method, path);
     const c = new Context(new HonoRequest(request, path, matchResult), {
-      env,
+      env: env2,
       executionCtx,
       notFoundHandler: this.notFoundHandler
     });
@@ -1079,34 +828,47 @@ var _Hono = class extends defineDynamicClass() {
       }
     })();
   }
+  fetch = (request, Env, executionCtx) => {
+    return this.dispatch(request, executionCtx, Env, request.method);
+  };
+  request = (input, requestInit, Env, executionCtx) => {
+    if (input instanceof Request) {
+      if (requestInit !== void 0) {
+        input = new Request(input, requestInit);
+      }
+      return this.fetch(input, Env, executionCtx);
+    }
+    input = input.toString();
+    const path = /^https?:\/\//.test(input) ? input : `http://localhost${mergePath("/", input)}`;
+    const req = new Request(path, requestInit);
+    return this.fetch(req, Env, executionCtx);
+  };
+  fire = () => {
+    addEventListener("fetch", (event) => {
+      event.respondWith(this.dispatch(event.request, event, void 0, event.request.method));
+    });
+  };
 };
-var Hono = _Hono;
-_path = /* @__PURE__ */ new WeakMap();
 
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/router/pattern-router/router.js
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/router/pattern-router/router.js
 var PatternRouter = class {
-  constructor() {
-    this.name = "PatternRouter";
-    this.routes = [];
-  }
+  name = "PatternRouter";
+  routes = [];
   add(method, path, handler) {
     const endsWithWildcard = path[path.length - 1] === "*";
     if (endsWithWildcard) {
       path = path.slice(0, -2);
     }
-    const parts = path.match(/\/?(:\w+(?:{(?:(?:{[\d,]+})|[^}])+})?)|\/?[^\/\?]+|(\?)/g) || [];
-    if (parts[parts.length - 1] === "?") {
-      this.add(method, parts.slice(0, parts.length - 2).join(""), handler);
-      parts.pop();
+    if (path.at(-1) === "?") {
+      path = path.slice(0, -1);
+      this.add(method, path.replace(/\/[^/]+$/, ""), handler);
     }
-    for (let i = 0, len = parts.length; i < len; i++) {
-      const match = parts[i].match(/^\/:([^{]+)(?:{(.*)})?/);
-      if (match) {
-        parts[i] = `/(?<${match[1]}>${match[2] || "[^/]+"})`;
-      } else if (parts[i] === "/*") {
-        parts[i] = "/[^/]+";
+    const parts = (path.match(/\/?(:\w+(?:{(?:(?:{[\d,]+})|[^}])+})?)|\/?[^\/\?]+/g) || []).map(
+      (part) => {
+        const match = part.match(/^\/:([^{]+)(?:{(.*)})?/);
+        return match ? `/(?<${match[1]}>${match[2] || "[^/]+"})` : part === "/*" ? "/[^/]+" : part.replace(/[.\\+*[^\]$()]/g, "\\$&");
       }
-    }
+    );
     let re;
     try {
       re = new RegExp(`^${parts.join("")}${endsWithWildcard ? "" : "/?$"}`);
@@ -1121,7 +883,7 @@ var PatternRouter = class {
       if (routeMethod === METHOD_NAME_ALL || routeMethod === method) {
         const match = pattern.exec(path);
         if (match) {
-          handlers.push([handler, match.groups || {}]);
+          handlers.push([handler, match.groups || /* @__PURE__ */ Object.create(null)]);
         }
       }
     }
@@ -1129,7 +891,7 @@ var PatternRouter = class {
   }
 };
 
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/preset/tiny.js
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/preset/tiny.js
 var Hono2 = class extends Hono {
   constructor(options = {}) {
     super(options);
@@ -1138,34 +900,31 @@ var Hono2 = class extends Hono {
 };
 
 // src/log.ts
-var LogLevel = /* @__PURE__ */ ((LogLevel2) => {
-  LogLevel2[LogLevel2["error"] = 3] = "error";
-  LogLevel2[LogLevel2["warn"] = 4] = "warn";
-  LogLevel2[LogLevel2["info"] = 5] = "info";
-  LogLevel2[LogLevel2["debug"] = 7] = "debug";
-  return LogLevel2;
-})(LogLevel || {});
-var currentlevel = 3 /* error */;
-function gen_logger(id) {
-  return mapValues(LogLevel, (value, name) => {
-    return (msg) => {
-      outFunc(name, value, `${id} ${JSON.stringify(msg)}`);
+var LEVEL = ["debug", "info", "warn", "error"];
+var Logger = class {
+  config;
+  debug;
+  info;
+  warn;
+  error;
+  constructor(config) {
+    const level = LEVEL.find((it) => it === config?.level) ?? "warn";
+    this.config = {
+      prefix: config?.prefix ?? "",
+      level
     };
-  });
-}
-function outFunc(levelName, levelValue, msg) {
-  if (levelValue > currentlevel) {
-    return;
+    for (const m of LEVEL) {
+      this[m] = (...data) => this.#write(m, ...data);
+    }
   }
-  console.log(`${Date.now().toLocaleString()} ${levelName} ${msg}`);
-}
-function mapValues(obj, fn) {
-  return Object.fromEntries(
-    Object.entries(obj).map(([key, value]) => {
-      return [key, fn(value, key, obj)];
-    })
-  );
-}
+  #write(level, ...data) {
+    const { level: configLevel, prefix } = this.config;
+    if (LEVEL.indexOf(level) < LEVEL.indexOf(configLevel)) {
+      return;
+    }
+    console[level](`${(/* @__PURE__ */ new Date()).toISOString()} ${level.toUpperCase()}${prefix ? ` ${prefix}` : ""}`, ...data);
+  }
+};
 
 // src/utils.ts
 function getToken(headers) {
@@ -1328,13 +1087,7 @@ function formatBlockErrorMessage(response) {
 
 // src/gemini-api-client/gemini-api-client.ts
 async function generateContent(apiParam, model, params, requestOptions) {
-  const url = new RequestUrl(
-    model,
-    "generateContent" /* GENERATE_CONTENT */,
-    /* stream */
-    false,
-    apiParam
-  );
+  const url = new RequestUrl(model, "generateContent" /* GENERATE_CONTENT */, false, apiParam);
   const response = await makeRequest(url, JSON.stringify(params), requestOptions);
   const responseJson = await response.json();
   const enhancedResponse = addHelpers(responseJson);
@@ -1345,7 +1098,7 @@ async function generateContent(apiParam, model, params, requestOptions) {
 async function makeRequest(url, body, requestOptions) {
   let response;
   try {
-    response = await fetch(url.toString(), {
+    response = await fetch(url.toURL(), {
       ...buildFetchOptions(requestOptions),
       method: "POST",
       headers: {
@@ -1361,12 +1114,12 @@ async function makeRequest(url, body, requestOptions) {
         if (json.error.details) {
           message += ` ${JSON.stringify(json.error.details)}`;
         }
-      } catch (e) {
+      } catch (_e) {
       }
       throw new Error(`[${response.status} ${response.statusText}] ${message}`);
     }
   } catch (e) {
-    const err = new GoogleGenerativeAIError(`Error fetching from ${url.toString()}: ${e.message}`);
+    const err = new GoogleGenerativeAIError(`Error fetching from ${url.toURL()} -> ${e.message}`);
     err.stack = e.stack;
     throw err;
   }
@@ -1379,15 +1132,13 @@ var RequestUrl = class {
     this.stream = stream2;
     this.apiParam = apiParam;
   }
-  toString() {
-    const urlSearchParams = new URLSearchParams({
-      key: this.apiParam.apikey
-    });
-    if (this.stream) {
-      urlSearchParams.append("alt", "sse");
-    }
+  toURL() {
     const api_version = this.apiParam.useBeta ? "v1beta" /* v1beta */ : "v1" /* v1 */;
-    const url = `${BASE_URL}/${api_version}/models/${this.model}:${this.task}?${urlSearchParams.toString()}`;
+    const url = new URL(`${BASE_URL}/${api_version}/models/${this.model}:${this.task}`);
+    url.searchParams.append("key", this.apiParam.apikey);
+    if (this.stream) {
+      url.searchParams.append("alt", "sse");
+    }
     return url;
   }
 };
@@ -1405,14 +1156,15 @@ function buildFetchOptions(requestOptions) {
 
 // src/openai/chat/completions/NonStreamingChatProxyHandler.ts
 var nonStreamingChatProxyHandler = async (c, req, apiParam) => {
-  const log2 = c.var.log;
+  const log = c.var.log;
   const [model, geminiReq] = genModel(req);
   const geminiResp = await generateContent(apiParam, model, geminiReq).then((it) => it.response.text()).catch((err) => {
-    log2.error(req);
-    log2.error(err?.message ?? err.toString());
+    log.error(req);
+    log.error(err?.message ?? err.toString());
     return err?.message ?? err.toString();
   });
-  log2.debug(geminiResp);
+  log.debug(req);
+  log.debug(geminiResp);
   const resp = {
     id: "chatcmpl-abc123",
     object: "chat.completion",
@@ -1430,10 +1182,14 @@ var nonStreamingChatProxyHandler = async (c, req, apiParam) => {
   return c.json(resp);
 };
 
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/utils/stream.js
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/utils/stream.js
 var StreamingApi = class {
+  writer;
+  encoder;
+  writable;
+  abortSubscribers = [];
+  responseReadable;
   constructor(writable, _readable) {
-    this.abortSubscribers = [];
     this.writable = writable;
     this.writer = writable.getWriter();
     this.encoder = new TextEncoder();
@@ -1479,12 +1235,12 @@ var StreamingApi = class {
     await body.pipeTo(this.writable, { preventClose: true });
     this.writer = this.writable.getWriter();
   }
-  async onAbort(listener) {
+  onAbort(listener) {
     this.abortSubscribers.push(listener);
   }
 };
 
-// node_modules/.deno/hono@4.0.8/node_modules/hono/dist/helper/streaming/sse.js
+// node_modules/.deno/hono@4.1.2/node_modules/hono/dist/helper/streaming/sse.js
 var SSEStreamingApi = class extends StreamingApi {
   constructor(writable, readable) {
     super(writable, readable);
@@ -1502,35 +1258,35 @@ var SSEStreamingApi = class extends StreamingApi {
     await this.write(sseData);
   }
 };
-var setSSEHeaders = (context) => {
-  context.header("Transfer-Encoding", "chunked");
-  context.header("Content-Type", "text/event-stream");
-  context.header("Cache-Control", "no-cache");
-  context.header("Connection", "keep-alive");
+var run = async (stream2, cb, onError) => {
+  try {
+    await cb(stream2);
+  } catch (e) {
+    if (e instanceof Error && onError) {
+      await onError(e, stream2);
+      await stream2.writeSSE({
+        event: "error",
+        data: e.message
+      });
+    } else {
+      console.error(e);
+    }
+  }
 };
 var streamSSE = (c, cb, onError) => {
   const { readable, writable } = new TransformStream();
   const stream2 = new SSEStreamingApi(writable, readable);
-  (async () => {
-    try {
-      await cb(stream2);
-    } catch (e) {
-      if (e instanceof Error && onError) {
-        await onError(e, stream2);
-      } else {
-        console.error(e);
-      }
-    } finally {
-      stream2.close();
-    }
-  })();
-  setSSEHeaders(c);
+  c.header("Transfer-Encoding", "chunked");
+  c.header("Content-Type", "text/event-stream");
+  c.header("Cache-Control", "no-cache");
+  c.header("Connection", "keep-alive");
+  run(stream2, cb, onError);
   return c.newResponse(stream2.responseReadable);
 };
 
 // src/openai/chat/completions/StreamingChatProxyHandler.ts
 var streamingChatProxyHandler = async (c, req, genAi) => {
-  const log2 = c.var.log;
+  const log = c.var.log;
   const genOpenAiResp = (content, stop) => ({
     id: "chatcmpl-abc123",
     object: "chat.completion.chunk",
@@ -1547,11 +1303,14 @@ var streamingChatProxyHandler = async (c, req, genAi) => {
   return streamSSE(c, async (sseStream) => {
     const [model, geminiReq] = genModel(req);
     const geminiResp = await generateContent(genAi, model, geminiReq).then((it) => it.response.text()).catch((e) => e.message ?? e?.toString());
+    log.debug(req);
+    log.debug(geminiResp);
     await sseStream.writeSSE({
-      data: JSON.stringify(genOpenAiResp(geminiResp, true))
+      data: JSON.stringify(genOpenAiResp(geminiResp, false))
     });
-    const geminiResult = geminiResp;
-    log2.info(geminiResult);
+    await sseStream.writeSSE({
+      data: JSON.stringify(genOpenAiResp("", true))
+    });
     await sseStream.writeSSE({ data: "[DONE]" });
     await sseStream.close();
   });
@@ -1559,9 +1318,9 @@ var streamingChatProxyHandler = async (c, req, genAi) => {
 
 // src/openai/chat/completions/ChatProxyHandler.ts
 var chatProxyHandler = async (c) => {
-  const log2 = c.var.log;
+  const log = c.var.log;
   const req = await c.req.json();
-  log2.debug(req);
+  log.debug(req);
   const headers = c.req.header();
   const apiParam = getToken(headers);
   if (apiParam == null) {
@@ -1636,22 +1395,26 @@ var modelDetail = async (c) => {
 };
 
 // src/app.ts
-var geminiProxy = async (c) => {
-  const rawReq = c.req.raw;
-  const url = new URL(rawReq.url);
-  url.host = "generativelanguage.googleapis.com";
-  url.port = "";
-  url.protocol = "https:";
-  const req = new Request(url, rawReq.clone());
-  const resp = await fetch(req);
-  return c.newResponse(resp.body, resp);
-};
-var app = new Hono2({ strict: true }).use("*", cors(), timing(), logger()).use("*", async (c, next) => {
-  const logger2 = gen_logger(crypto.randomUUID());
-  c.set("log", logger2);
+var app = new Hono2({ strict: true }).use("*", async (c, next) => {
+  const logger = new Logger({
+    level: env(c)?.LogLevel,
+    prefix: crypto.randomUUID()
+  });
+  c.set("log", logger);
   await next();
-  c.set("log", void 0);
-}).options("*", (c) => c.text("", 204)).get("/", (c) => {
+}).use("*", async (c, next) => {
+  c.var.log.warn(`--> ${c.req.method} ${c.req.path}`);
+  await next();
+  c.var.log.warn(`<-- ${c.req.method} ${c.req.path}`);
+}).options("*", () => {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Methods": ["GET", "HEAD", "PUT", "POST", "DELETE", "PATCH"].join(","),
+      "Access-Control-Allow-Origin": "*"
+    }
+  });
+}).get("/", (c) => {
   const origin = new URL(c.req.url).origin;
   return c.text(`
 Hello Gemini-OpenAI-Proxy from ${getRuntimeKey()}! 
@@ -1667,7 +1430,16 @@ curl ${origin}/v1/chat/completions \\
         "temperature": 0.7
         }'
 `);
-}).post("/v1/chat/completions", chatProxyHandler).get("/v1/models", models).get("/v1/models/:model", modelDetail).post(":model_version/models/:model_and_action", geminiProxy);
+}).post("/v1/chat/completions", chatProxyHandler).get("/v1/models", models).get("/v1/models/:model", modelDetail).post(":model_version/models/:model_and_action", async (c) => {
+  const rawReq = c.req.raw;
+  const url = new URL(rawReq.url);
+  url.host = "generativelanguage.googleapis.com";
+  url.port = "";
+  url.protocol = "https:";
+  const req = new Request(url, rawReq);
+  const resp = await fetch(req);
+  return c.newResponse(resp.body, resp);
+});
 
 // main_deno.ts
 Deno.serve({ port: 8e3 }, app.fetch);

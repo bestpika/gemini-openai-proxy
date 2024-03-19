@@ -2,7 +2,7 @@ import { streamSSE } from "hono/streaming"
 import { generateContent } from "../../../gemini-api-client/gemini-api-client.ts"
 import type { OpenAI } from "../../../types.ts"
 import { genModel } from "../../../utils.ts"
-import { ChatProxyHandlerType } from "./ChatProxyHandler.ts"
+import type { ChatProxyHandlerType } from "./ChatProxyHandler.ts"
 
 export const streamingChatProxyHandler: ChatProxyHandlerType = async (c, req, genAi) => {
   const log = c.var.log
@@ -28,11 +28,15 @@ export const streamingChatProxyHandler: ChatProxyHandlerType = async (c, req, ge
       .then((it) => it.response.text())
       .catch((e) => e.message ?? e?.toString())
 
+    log.debug(req)
+    log.debug(geminiResp)
+
     await sseStream.writeSSE({
-      data: JSON.stringify(genOpenAiResp(geminiResp, true)),
+      data: JSON.stringify(genOpenAiResp(geminiResp, false)),
     })
-    const geminiResult = geminiResp
-    log.info(geminiResult)
+    await sseStream.writeSSE({
+      data: JSON.stringify(genOpenAiResp("", true)),
+    })
 
     await sseStream.writeSSE({ data: "[DONE]" })
     await sseStream.close()
